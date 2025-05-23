@@ -1427,7 +1427,7 @@ func TestDeleteCompactionBlockAfterFailedReload(t *testing.T) {
 
 			require.Equal(t, 0.0, prom_testutil.ToFloat64(db.metrics.reloadsFailed), "initial 'failed db reloadBlocks' count metrics mismatch")
 			require.Equal(t, 0.0, prom_testutil.ToFloat64(db.compactor.(*LeveledCompactor).metrics.Ran), "initial `compactions` count metric mismatch")
-			require.Equal(t, 0.0, prom_testutil.ToFloat64(db.metrics.compactionsFailed), "initial `compactions failed` count metric mismatch")
+			require.Equal(t, 0.0, prom_testutil.ToFloat64(db.metrics.compactionsFailed.WithLabelValues("head")), "initial `compactions failed` count metric mismatch")
 
 			// Do the compaction and check the metrics.
 			// Compaction should succeed, but the reloadBlocks should fail and
@@ -1435,7 +1435,7 @@ func TestDeleteCompactionBlockAfterFailedReload(t *testing.T) {
 			require.Error(t, db.Compact(ctx))
 			require.Equal(t, 1.0, prom_testutil.ToFloat64(db.metrics.reloadsFailed), "'failed db reloadBlocks' count metrics mismatch")
 			require.Equal(t, 1.0, prom_testutil.ToFloat64(db.compactor.(*LeveledCompactor).metrics.Ran), "`compaction` count metric mismatch")
-			require.Equal(t, 1.0, prom_testutil.ToFloat64(db.metrics.compactionsFailed), "`compactions failed` count metric mismatch")
+			require.Equal(t, 1.0, prom_testutil.ToFloat64(db.metrics.compactionsFailed.WithLabelValues("head")), "`compactions failed` count metric mismatch")
 
 			actBlocks, err = blockDirs(db.Dir())
 			require.NoError(t, err)
@@ -2017,7 +2017,7 @@ func TestDelayedCompaction(t *testing.T) {
 				// The db.compactc signals have been processed multiple times since a compaction is triggered every 1ms by waitUntilCompacted.
 				// This implies that the compaction delay doesn't block or wait on the initial trigger.
 				// 3 is an arbitrary value because it's difficult to determine the precise value.
-				require.GreaterOrEqual(t, prom_testutil.ToFloat64(db.metrics.compactionsTriggered)-prom_testutil.ToFloat64(db.metrics.compactionsSkipped), 3.0)
+				require.GreaterOrEqual(t, prom_testutil.ToFloat64(db.metrics.compactionsTriggered.WithLabelValues("head"))-prom_testutil.ToFloat64(db.metrics.compactionsSkipped.WithLabelValues("head")), 3.0)
 				// The delay doesn't change the head blocks alignment.
 				require.Eventually(t, func() bool {
 					return db.head.MinTime() == db.compactor.(*LeveledCompactor).ranges[0]+1

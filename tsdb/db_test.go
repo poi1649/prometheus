@@ -5416,6 +5416,73 @@ func testOOOCompactionWithDisabledWriteLog(t *testing.T, scenario sampleTypeScen
 	verifySamples(db.Blocks()[1], 250, 350)
 }
 
+// TestScheduledOOOCompaction tests if scheduled OOO compaction is performed 
+// without dependency on in-order head compaction.
+func TestScheduledOOOCompaction(t *testing.T) {
+	for name, scenario := range sampleTypeScenarios {
+		t.Run(name, func(t *testing.T) {
+			testScheduledOOOCompaction(t, scenario)
+		})
+	}
+}
+
+func testScheduledOOOCompaction(t *testing.T, scenario sampleTypeScenario) {
+	dir := t.TempDir()
+
+	// Set a short interval for testing
+	opts := DefaultOptions()
+	opts.OutOfOrderCapMax = 30
+	opts.OutOfOrderTimeWindow = 300 * time.Minute.Milliseconds()
+	opts.OutOfOrderCompactInterval = 100 * time.Millisecond
+	opts.EnableNativeHistograms = true
+
+	db, err := Open(dir, nil, nil, opts, nil)
+	require.NoError(t, err)
+	db.EnableNativeHistograms()
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+
+	series1 := labels.FromStrings("foo", "bar1")
+	series2 := labels.FromStrings("foo", "bar2")
+
+	addSamples := func(fromMins, toMins int64) {
+		app := db.Appender(context.Background())
+		for m := fromMins; m <= toMins; m++ {
+			ts := m * time.Minute.Milliseconds()
+			_, _, err := scenario.appendFunc(app, series1, ts, ts)
+			require.NoError(t, err)
+			_, _, err = scenario.appendFunc(app, series2, ts, 2*ts)
+			require.NoError(t, err)
+		}
+		require.NoError(t, app.Commit())
+	}
+
+	// Add in-order samples (not enough to trigger head compaction)
+	addSamples(250, 260) 
+
+	// Add OOO samples
+	addSamples(90, 110)
+
+	// Checking that ooo chunk is not empty
+	for _, lbls := range []labels.Labels{series1, series2} {
+		ms, created, err := db.head.getOrCreate(lbls.Hash(), lbls, false)
+		require.NoError(t, err)
+		require.False(t, created)
+		require.Positive(t, ms.ooo.oooHeadChunk.chunk.NumSamples())
+	}
+
+	// Get initial OOO compaction count
+	initialCount := prom_testutil.ToFloat64(db.metrics.compactionsTriggered.WithLabelValues("ooo"))
+
+	// Wait for scheduled OOO compaction to trigger
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify that OOO compaction was triggered
+	newCount := prom_testutil.ToFloat64(db.metrics.compactionsTriggered.WithLabelValues("ooo"))
+	require.Greater(t, newCount, initialCount, "OOO compaction should have been triggered")
+}
+
 // TestOOOQueryAfterRestartWithSnapshotAndRemovedWBL tests the scenario where the WBL goes
 // missing after a restart while snapshot was enabled, but the query still returns the right
 // data from the mmap chunks.
