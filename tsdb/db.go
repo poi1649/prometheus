@@ -1090,9 +1090,9 @@ func (db *DB) run(ctx context.Context) {
 	// Calculate the initial delay for OOO compaction to align with wall clock.
 	outOfOrderCompactInterval := db.opts.OutOfOrderCompactInterval
 	if outOfOrderCompactInterval <= 0 {
-		outOfOrderCompactInterval = 2 * time.Hour
+		outOfOrderCompactInterval = DefaultOptions().OutOfOrderCompactInterval
 	}
-	
+
 	// We align the out-of-order compactions to happen with in-order compaction, which happens midway
 	// between aligned intervals of time.
 	var oooScheduledCompact *time.Timer
@@ -1102,9 +1102,7 @@ func (db *DB) run(ctx context.Context) {
 		// For very short intervals (used in tests), skip alignment
 		oooScheduledCompact = time.NewTimer(outOfOrderCompactInterval)
 	} else {
-		// Aligned 'now'. In this example, an even hour.
 		nextCompaction := (nowUnix / oooCompactionIntvSec) * oooCompactionIntvSec
-		// Move the aligned 'now' to midway of the interval. In this example, the next odd hour.
 		nextCompaction += oooCompactionIntvSec / 2
 		if nextCompaction < nowUnix {
 			nextCompaction += oooCompactionIntvSec
