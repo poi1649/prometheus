@@ -1087,21 +1087,21 @@ func (db *DB) run(ctx context.Context) {
 
 	backoff := time.Duration(0)
 
-	// Calculate the initial delay for OOO compaction to align with wall clock.
-	outOfOrderCompactInterval := db.opts.OutOfOrderCompactInterval
-	if outOfOrderCompactInterval <= 0 {
-		outOfOrderCompactInterval = DefaultOptions().OutOfOrderCompactInterval
+	outOfOrderCompactionInterval := db.opts.OutOfOrderCompactInterval
+	if outOfOrderCompactionInterval <= 0 {
+		outOfOrderCompactionInterval = DefaultOptions().OutOfOrderCompactInterval
 	}
 
-	// We align the out-of-order compactions to happen with in-order compaction, which happens midway
-	// between aligned intervals of time.
 	var oooScheduledCompact *time.Timer
-	nowUnix := time.Now().Unix()
-	oooCompactionIntvSec := int64(outOfOrderCompactInterval / time.Second)
+
+	oooCompactionIntvSec := int64(outOfOrderCompactionInterval / time.Second)
 	if oooCompactionIntvSec == 0 {
-		// For very short intervals (used in tests), skip alignment
-		oooScheduledCompact = time.NewTimer(outOfOrderCompactInterval)
+		// For very short intervals, skip alignment
+		oooScheduledCompact = time.NewTimer(outOfOrderCompactionInterval)
 	} else {
+		// We align the out-of-order compactions to happen with in-order compaction, which happens midway
+		// between aligned intervals of time.
+		nowUnix := time.Now().Unix()
 		nextCompaction := (nowUnix / oooCompactionIntvSec) * oooCompactionIntvSec
 		nextCompaction += oooCompactionIntvSec / 2
 		if nextCompaction < nowUnix {
@@ -1138,7 +1138,7 @@ func (db *DB) run(ctx context.Context) {
 			db.autoCompactMtx.Lock()
 			if db.autoCompact {
 				if err := db.Compact(ctx); err != nil {
-					db.logger.Error("compaction failed", "err", err)
+					db.logger.Error("head compaction failed", "err", err)
 					backoff = exponential(backoff, 1*time.Second, 1*time.Minute)
 				} else {
 					backoff = 0
@@ -1148,14 +1148,14 @@ func (db *DB) run(ctx context.Context) {
 			}
 			db.autoCompactMtx.Unlock()
 		case <-oooScheduledCompact.C:
-			oooScheduledCompact.Reset(outOfOrderCompactInterval)
+			oooScheduledCompact.Reset(outOfOrderCompactionInterval)
 
 			db.metrics.compactionsTriggered.WithLabelValues("ooo").Inc()
 
 			db.autoCompactMtx.Lock()
 			if db.autoCompact {
 				if err := db.CompactOOOHead(ctx); err != nil && !errors.Is(err, context.Canceled) {
-					db.logger.Error("OOO compaction failed", "err", err)
+					db.logger.Error("OOO head compaction failed", "err", err)
 					db.metrics.compactionsFailed.WithLabelValues("ooo").Inc()
 				}
 			} else {
