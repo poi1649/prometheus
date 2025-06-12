@@ -87,6 +87,7 @@ func DefaultOptions() *Options {
 		IsolationDisabled:           defaultIsolationDisabled,
 		HeadChunksWriteQueueSize:    chunks.DefaultWriteQueueSize,
 		OutOfOrderCapMax:            DefaultOutOfOrderCapMax,
+		OutOfOrderCompactInterval:   2 * time.Hour,
 		EnableOverlappingCompaction: true,
 		EnableSharding:              false,
 		EnableDelayedCompaction:     false,
@@ -187,6 +188,10 @@ type Options struct {
 	// OutOfOrderCapMax is maximum capacity for OOO chunks (in samples).
 	// If it is <=0, the default value is assumed.
 	OutOfOrderCapMax int64
+
+	// OutOfOrderCompactInterval controls how often OOO compaction is triggered.
+	// If it is <=0, the default value (2 hours) is used.
+	OutOfOrderCompactInterval time.Duration
 
 	// Compaction of overlapping blocks are allowed if EnableOverlappingCompaction is true.
 	// This is an optional flag for overlapping blocks.
@@ -292,9 +297,9 @@ type dbMetrics struct {
 	symbolTableSize      prometheus.GaugeFunc
 	reloads              prometheus.Counter
 	reloadsFailed        prometheus.Counter
-	compactionsFailed    prometheus.Counter
-	compactionsTriggered prometheus.Counter
-	compactionsSkipped   prometheus.Counter
+	compactionsFailed    prometheus.CounterVec
+	compactionsTriggered prometheus.CounterVec
+	compactionsSkipped   prometheus.CounterVec
 	sizeRetentionCount   prometheus.Counter
 	timeRetentionCount   prometheus.Counter
 	startTime            prometheus.GaugeFunc
@@ -336,22 +341,22 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		Name: "prometheus_tsdb_reloads_failures_total",
 		Help: "Number of times the database failed to reloadBlocks block data from disk.",
 	})
-	m.compactionsTriggered = prometheus.NewCounter(prometheus.CounterOpts{
+	m.compactionsTriggered = *prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "prometheus_tsdb_compactions_triggered_total",
 		Help: "Total number of triggered compactions for the partition.",
-	})
-	m.compactionsFailed = prometheus.NewCounter(prometheus.CounterOpts{
+	}, []string{"type"})
+	m.compactionsFailed = *prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "prometheus_tsdb_compactions_failed_total",
 		Help: "Total number of compactions that failed for the partition.",
-	})
+	}, []string{"type"})
 	m.timeRetentionCount = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "prometheus_tsdb_time_retentions_total",
 		Help: "The number of times that blocks were deleted because the maximum time limit was exceeded.",
 	})
-	m.compactionsSkipped = prometheus.NewCounter(prometheus.CounterOpts{
+	m.compactionsSkipped = *prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "prometheus_tsdb_compactions_skipped_total",
 		Help: "Total number of skipped compactions due to disabled auto compaction.",
-	})
+	}, []string{"type"})
 	m.startTime = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_lowest_timestamp",
 		Help: "Lowest timestamp value stored in the database. The unit is decided by the library consumer.",
@@ -393,9 +398,9 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 			m.symbolTableSize,
 			m.reloads,
 			m.reloadsFailed,
-			m.compactionsFailed,
-			m.compactionsTriggered,
-			m.compactionsSkipped,
+			&m.compactionsFailed,
+			&m.compactionsTriggered,
+			&m.compactionsSkipped,
 			m.sizeRetentionCount,
 			m.timeRetentionCount,
 			m.startTime,
@@ -1082,6 +1087,30 @@ func (db *DB) run(ctx context.Context) {
 
 	backoff := time.Duration(0)
 
+	outOfOrderCompactionInterval := db.opts.OutOfOrderCompactInterval
+	if outOfOrderCompactionInterval <= 0 {
+		outOfOrderCompactionInterval = DefaultOptions().OutOfOrderCompactInterval
+	}
+
+	var oooScheduledCompact *time.Timer
+
+	oooCompactionIntvSec := int64(outOfOrderCompactionInterval / time.Second)
+	if oooCompactionIntvSec == 0 {
+		// For very short intervals, skip alignment
+		oooScheduledCompact = time.NewTimer(outOfOrderCompactionInterval)
+	} else {
+		// We align the out-of-order compactions to happen with in-order compaction, which happens midway
+		// between aligned intervals of time.
+		nowUnix := time.Now().Unix()
+		nextCompaction := (nowUnix / oooCompactionIntvSec) * oooCompactionIntvSec
+		nextCompaction += oooCompactionIntvSec / 2
+		if nextCompaction < nowUnix {
+			nextCompaction += oooCompactionIntvSec
+		}
+		timeUntilNextCompaction := time.Duration(nextCompaction-nowUnix) * time.Second
+		oooScheduledCompact = time.NewTimer(timeUntilNextCompaction)
+	}
+
 	for {
 		select {
 		case <-db.stopc:
@@ -1104,18 +1133,33 @@ func (db *DB) run(ctx context.Context) {
 			// We attempt mmapping of head chunks regularly.
 			db.head.mmapHeadChunks()
 		case <-db.compactc:
-			db.metrics.compactionsTriggered.Inc()
+			db.metrics.compactionsTriggered.WithLabelValues("head").Inc()
 
 			db.autoCompactMtx.Lock()
 			if db.autoCompact {
 				if err := db.Compact(ctx); err != nil {
-					db.logger.Error("compaction failed", "err", err)
+					db.logger.Error("head compaction failed", "err", err)
 					backoff = exponential(backoff, 1*time.Second, 1*time.Minute)
 				} else {
 					backoff = 0
 				}
 			} else {
-				db.metrics.compactionsSkipped.Inc()
+				db.metrics.compactionsSkipped.WithLabelValues("head").Inc()
+			}
+			db.autoCompactMtx.Unlock()
+		case <-oooScheduledCompact.C:
+			oooScheduledCompact.Reset(outOfOrderCompactionInterval)
+
+			db.metrics.compactionsTriggered.WithLabelValues("ooo").Inc()
+
+			db.autoCompactMtx.Lock()
+			if db.autoCompact {
+				if err := db.CompactOOOHead(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					db.logger.Error("OOO head compaction failed", "err", err)
+					db.metrics.compactionsFailed.WithLabelValues("ooo").Inc()
+				}
+			} else {
+				db.metrics.compactionsSkipped.WithLabelValues("ooo").Inc()
 			}
 			db.autoCompactMtx.Unlock()
 		case <-db.stopc:
@@ -1241,7 +1285,7 @@ func (db *DB) Compact(ctx context.Context) (returnErr error) {
 		if returnErr != nil && !errors.Is(returnErr, context.Canceled) {
 			// If we got an error because context was canceled then we're most likely
 			// shutting down TSDB and we don't need to report this on metrics
-			db.metrics.compactionsFailed.Inc()
+			db.metrics.compactionsFailed.WithLabelValues("head").Inc()
 		}
 	}()
 
